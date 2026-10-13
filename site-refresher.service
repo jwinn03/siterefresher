@@ -1,0 +1,16 @@
+[Unit]
+Description=Site Refresher - watch a webpage for a phrase change and alert via Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust User and paths to match your Raspberry Pi setup.
+User=pi
+WorkingDirectory=/home/pi/siterefresher
+ExecStart=/home/pi/siterefresher/.venv/bin/python /home/pi/siterefresher/site_refresher.py --config /home/pi/siterefresher/config.ini
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

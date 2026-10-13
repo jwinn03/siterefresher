@@ -1,0 +1,11 @@
+# Local configuration & runtime state — never commit secrets
+config.ini
+state.json
+state.json.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
