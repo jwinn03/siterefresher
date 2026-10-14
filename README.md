@@ -10,7 +10,7 @@ dependency is [`requests`](https://pypi.org/project/requests/).
 
 ## How it works
 
-1. Fetches the page over HTTPS with a browser-like User-Agent.
+1. Fetches the page (via plain HTTP or a real browser — see *Fetch backends*).
 2. Checks whether the configured phrase is present in the HTML.
 3. Compares to the last-seen state (persisted in `state.json`, so restarts don't
    re-alert).
@@ -19,6 +19,30 @@ dependency is [`requests`](https://pypi.org/project/requests/).
 
 It also optionally alerts if the site becomes unreachable, and again when it
 recovers.
+
+## Fetch backends
+
+Set `fetch_backend` in `config.ini`:
+
+- **`requests`** (default) — fast, no browser. Works for ordinary
+  server-rendered pages. If the target returns a bot-protection challenge, the
+  program raises a clear error instead of silently misreporting the phrase.
+- **`selenium`** — drives a real Chromium browser, executes JavaScript, and gets
+  past bot-protection challenges. **Required for JS-rendered / protected sites.**
+
+### Important: anti-bot protection (e.g. etix.com)
+
+Some ticketing sites layer bot protection in front of the page:
+
+- **AWS WAF** serves a non-interactive JavaScript challenge. A browser (the
+  `selenium` backend) solves it automatically.
+- **DataDome** performs a "device check" that **specifically detects and blocks
+  headless browsers**. To get past it you must run the browser **non-headless**
+  (`headless = false`). On a desktop a window appears; on a headless Pi/server
+  you supply a virtual display with `xvfb` (see below).
+
+`etix.com` uses *both*. The working configuration is `fetch_backend = selenium`
+with `headless = false`.
 
 ## Setup
 
@@ -31,6 +55,11 @@ Python 3.9+ is required.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+
+# For the selenium backend on Raspberry Pi OS, also install Chromium + xvfb:
+sudo apt install chromium chromium-driver xvfb
+# then set in config.ini:  browser_binary = /usr/bin/chromium
+#                          driver_path    = /usr/bin/chromedriver
 ```
 
 ```powershell
@@ -79,6 +108,9 @@ Leave it running; stop with `Ctrl+C`.
 
 ## Running 24/7 on a Raspberry Pi (systemd)
 
+The provided service file wraps the program in `xvfb-run` so a non-headless
+Chromium works without a desktop (needed for DataDome sites like etix.com).
+
 ```bash
 # Place the project in /home/pi/siterefresher and create the venv there.
 sudo cp site-refresher.service /etc/systemd/system/
@@ -116,11 +148,16 @@ export SR_TELEGRAM_CHAT_ID="987654321"
 | `watch`    | `phrase`         | `Tickets Currently Not Available`| Phrase whose presence is tracked          |
 | `watch`    | `min_interval`   | `70`                             | Min seconds between checks                 |
 | `watch`    | `max_interval`   | `90`                             | Max seconds between checks                 |
-| `watch`    | `request_timeout`| `30`                             | HTTP timeout (seconds)                     |
+| `watch`    | `fetch_backend`  | `requests`                       | `requests` or `selenium`                  |
+| `watch`    | `page_load_timeout`| `30`                           | Max s to wait for JS/challenge to render  |
+| `watch`    | `request_timeout`| `30`                             | HTTP timeout (seconds, requests backend)  |
 | `watch`    | `case_sensitive` | `false`                          | Match phrase case-sensitively             |
 | `watch`    | `verify_tls`     | `true`                           | Verify TLS certificates                    |
 | `watch`    | `state_file`     | `state.json`                     | Where last-seen state is stored           |
 | `watch`    | `user_agent`     | *(Chrome-like)*                  | HTTP User-Agent header                     |
+| `selenium` | `headless`       | `true`                           | Run browser headless (set `false` for DataDome) |
+| `selenium` | `browser_binary` | *(auto)*                         | Path to Chrome/Chromium (Pi: `/usr/bin/chromium`) |
+| `selenium` | `driver_path`    | *(auto)*                         | Path to chromedriver (Pi: `/usr/bin/chromedriver`) |
 | `telegram` | `token`          | *(empty)*                        | Bot token from @BotFather                 |
 | `telegram` | `chat_id`        | *(empty)*                        | Your chat id                              |
 | `telegram` | `notify_on_start`| `true`                           | Send a message when the watcher starts    |

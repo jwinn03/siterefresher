@@ -51,6 +51,11 @@ class Config:
     error_threshold: int
     case_sensitive: bool
     verify_tls: bool
+    fetch_backend: str
+    page_load_timeout: float
+    browser_binary: str
+    driver_path: str
+    headless: bool
 
     @staticmethod
     def load(path: Path) -> "Config":
@@ -119,12 +124,201 @@ class Config:
             error_threshold=get_int("telegram", "error_threshold", 3),
             case_sensitive=get_bool("watch", "case_sensitive", False),
             verify_tls=get_bool("watch", "verify_tls", True),
+            fetch_backend=(get("watch", "fetch_backend", "requests") or "requests").strip().lower(),
+            page_load_timeout=get_float("watch", "page_load_timeout", 30.0),
+            browser_binary=get("selenium", "browser_binary", "") or "",
+            driver_path=get("selenium", "driver_path", "") or "",
+            headless=get_bool("selenium", "headless", True),
         )
 
         if cfg.min_interval > cfg.max_interval:
             raise SystemExit("ERROR: min_interval must be <= max_interval.")
 
+        if cfg.fetch_backend not in ("requests", "selenium"):
+            raise SystemExit(
+                f"ERROR: unknown fetch_backend '{cfg.fetch_backend}' "
+                "(expected 'requests' or 'selenium')."
+            )
+
         return cfg
+
+
+# --------------------------------------------------------------------------- #
+# Fetch backends
+# --------------------------------------------------------------------------- #
+class FetchError(Exception):
+    """Raised when a page cannot be fetched/rendered for a real reason."""
+
+
+class ChallengeError(FetchError):
+    """Raised when the response is a bot-protection challenge, not real content."""
+
+
+# Header set when AWS WAF intercepts a request with a JS challenge / CAPTCHA.
+_WAF_HEADER = "x-amzn-waf-action"
+# Interstitials served by DataDome (detected on sites like etix.com). These
+# block headless browsers specifically — run with headless = false to pass.
+_DATADOME_MARKERS = ("captcha-delivery.com", "datadome")
+# The AWS WAF JS-challenge shell page. Note: the string "awswaf" can also appear
+# in a fully rendered real page, so we only treat it as a challenge when the
+# challenge container is present AND the document is still tiny.
+_WAF_CHALLENGE_MARKER = "challenge-container"
+# Below this many bytes, a document is almost certainly an interstitial/shell
+# rather than a rendered page.
+_MIN_CONTENT_LENGTH = 3000
+
+
+def _classify(html: str):
+    """Return (is_interstitial, reason) for a rendered document."""
+    low = html.lower()
+    if any(m in low for m in _DATADOME_MARKERS):
+        return True, "DataDome device check (run with headless = false)"
+    if _WAF_CHALLENGE_MARKER in low and len(html) < _MIN_CONTENT_LENGTH:
+        return True, "AWS WAF JavaScript challenge"
+    return False, ""
+
+
+class RequestsFetcher:
+    """Lightweight fetcher using `requests`. Cannot execute JavaScript, so it
+    fails loudly on JS/WAF-challenged pages instead of returning junk."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": cfg.user_agent,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+        )
+
+    def fetch(self, url: str) -> str:
+        try:
+            resp = self.session.get(
+                url, timeout=self.cfg.request_timeout, verify=self.cfg.verify_tls
+            )
+        except requests.RequestException as exc:
+            raise FetchError(str(exc)) from exc
+
+        action = resp.headers.get(_WAF_HEADER)
+        if action or resp.status_code == 202:
+            raise ChallengeError(
+                f"Site returned a bot-protection challenge "
+                f"({_WAF_HEADER}={action or 'n/a'}, status={resp.status_code}). "
+                "This page needs the 'selenium' fetch_backend."
+            )
+        if resp.status_code >= 400:
+            raise FetchError(f"HTTP {resp.status_code}")
+        return resp.text
+
+    def close(self) -> None:
+        self.session.close()
+
+
+class SeleniumFetcher:
+    """Headless-Chromium fetcher. Executes JavaScript and automatically solves
+    non-interactive challenges (e.g. AWS WAF 'challenge'), then returns the
+    fully rendered page HTML. Keeps one browser instance alive across checks."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.driver = None
+        self._build_driver()
+
+    def _build_driver(self) -> None:
+        try:
+            from selenium import webdriver
+            from selenium.webdriver.chrome.options import Options
+            from selenium.webdriver.chrome.service import Service
+        except ImportError as exc:  # pragma: no cover
+            raise SystemExit(
+                "ERROR: the 'selenium' fetch_backend requires Selenium.\n"
+                "Install it with:  pip install selenium\n"
+                "On Raspberry Pi also:  sudo apt install chromium chromium-driver"
+            ) from exc
+
+        opts = Options()
+        if self.cfg.headless:
+            opts.add_argument("--headless=new")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--window-size=1280,1696")
+        opts.add_argument(f"--user-agent={self.cfg.user_agent}")
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
+        if self.cfg.browser_binary:
+            opts.binary_location = self.cfg.browser_binary
+
+        service = Service(executable_path=self.cfg.driver_path) if self.cfg.driver_path else Service()
+
+        LOG.info(
+            "Launching Chromium (selenium backend, headless=%s)...", self.cfg.headless
+        )
+        self.driver = webdriver.Chrome(options=opts, service=service)
+        self.driver.set_page_load_timeout(self.cfg.page_load_timeout + 15)
+        # Hide the webdriver flag from page JS.
+        try:
+            self.driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"},
+            )
+        except Exception:  # pragma: no cover - not all drivers support CDP
+            pass
+
+    def fetch(self, url: str) -> str:
+        from selenium.common.exceptions import TimeoutException, WebDriverException
+
+        try:
+            self.driver.get(url)
+        except TimeoutException:
+            # Page load event didn't fire in time, but the DOM may still be
+            # usable (challenge pages can keep connections open). Fall through
+            # and inspect what we have.
+            LOG.debug("Selenium page load timed out; inspecting current DOM.")
+        except WebDriverException as exc:
+            raise FetchError(f"browser error: {exc}") from exc
+
+        # Wait for any non-interactive challenge to clear and real content to
+        # render. The AWS WAF challenge solves itself and reloads the page;
+        # DataDome only clears for a non-headless browser.
+        deadline = time.monotonic() + self.cfg.page_load_timeout
+        last_src = ""
+        last_reason = ""
+        while True:
+            last_src = self.driver.page_source or ""
+            interstitial, last_reason = _classify(last_src)
+            if not interstitial and len(last_src) >= _MIN_CONTENT_LENGTH:
+                return last_src
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(1.0)
+
+        interstitial, last_reason = _classify(last_src)
+        if interstitial:
+            raise ChallengeError(
+                f"Bot-protection challenge did not clear within "
+                f"{self.cfg.page_load_timeout:.0f}s: {last_reason}."
+            )
+        # Not an interstitial, just thin — return what we have so the phrase
+        # check can run against it.
+        return last_src
+
+    def close(self) -> None:
+        if self.driver is not None:
+            try:
+                self.driver.quit()
+            except Exception:  # pragma: no cover
+                pass
+            self.driver = None
+
+
+def make_fetcher(cfg: Config):
+    if cfg.fetch_backend == "selenium":
+        return SeleniumFetcher(cfg)
+    return RequestsFetcher(cfg)
 
 
 # --------------------------------------------------------------------------- #
@@ -191,11 +385,10 @@ def save_state(path: Path, state: dict) -> None:
 # Core watcher
 # --------------------------------------------------------------------------- #
 class Watcher:
-    def __init__(self, cfg: Config, telegram: Telegram):
+    def __init__(self, cfg: Config, telegram: Telegram, fetcher):
         self.cfg = cfg
         self.telegram = telegram
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": cfg.user_agent})
+        self.fetcher = fetcher
         self.state = load_state(cfg.state_file)
         self.consecutive_errors = 0
         self.error_notified = False
@@ -206,13 +399,7 @@ class Watcher:
         self._stop = True
 
     def fetch(self) -> str:
-        resp = self.session.get(
-            self.cfg.url,
-            timeout=self.cfg.request_timeout,
-            verify=self.cfg.verify_tls,
-        )
-        resp.raise_for_status()
-        return resp.text
+        return self.fetcher.fetch(self.cfg.url)
 
     def phrase_present(self, html: str) -> bool:
         if self.cfg.case_sensitive:
@@ -222,7 +409,7 @@ class Watcher:
     def check_once(self) -> None:
         try:
             html = self.fetch()
-        except requests.RequestException as exc:
+        except (FetchError, requests.RequestException) as exc:
             self.consecutive_errors += 1
             LOG.warning(
                 "Fetch failed (%d consecutive): %s",
@@ -356,18 +543,21 @@ def main(argv: Optional[list] = None) -> int:
         ok = telegram.send("✅ Site Refresher test message — Telegram is configured correctly.")
         return 0 if ok else 1
 
-    watcher = Watcher(cfg, telegram)
+    fetcher = make_fetcher(cfg)
+    watcher = Watcher(cfg, telegram, fetcher)
 
     # Graceful shutdown on Ctrl+C and SIGTERM (systemd stop).
     signal.signal(signal.SIGINT, watcher.request_stop)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, watcher.request_stop)
 
-    if args.once:
-        watcher.check_once()
-        return 0
-
-    watcher.run()
+    try:
+        if args.once:
+            watcher.check_once()
+        else:
+            watcher.run()
+    finally:
+        fetcher.close()
     return 0
 
 

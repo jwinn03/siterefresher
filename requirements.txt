@@ -1,1 +1,5 @@
 requests>=2.31.0
+# Required only when fetch_backend = selenium (needed for JS-rendered / WAF-
+# protected sites such as etix.com). On Raspberry Pi also install Chromium:
+#   sudo apt install chromium chromium-driver
+selenium>=4.15.0

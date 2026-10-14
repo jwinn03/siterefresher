@@ -8,7 +8,12 @@ Type=simple
 # Adjust User and paths to match your Raspberry Pi setup.
 User=pi
 WorkingDirectory=/home/pi/siterefresher
-ExecStart=/home/pi/siterefresher/.venv/bin/python /home/pi/siterefresher/site_refresher.py --config /home/pi/siterefresher/config.ini
+# When fetch_backend = selenium with headless = false (required for DataDome-
+# protected sites like etix.com), wrap the command in xvfb-run so Chromium has a
+# virtual display. Install it first:  sudo apt install xvfb chromium chromium-driver
+ExecStart=/usr/bin/xvfb-run -a /home/pi/siterefresher/.venv/bin/python /home/pi/siterefresher/site_refresher.py --config /home/pi/siterefresher/config.ini
+# If your target site works with a plain headless browser (no DataDome), you can
+# drop the xvfb-run prefix and set headless = true in config.ini instead.
 Restart=always
 RestartSec=10
 
