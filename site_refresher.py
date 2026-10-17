@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import random
+import shutil
 import signal
 import sys
 import time
@@ -325,10 +326,11 @@ class SeleniumFetcher:
         opts = uc.ChromeOptions()
         self._common_args(opts)
         kwargs = {"options": opts, "headless": self.cfg.headless}
-        # undetected-chromedriver patches a copy of the given chromedriver; on a
-        # Pi point it at the system one so it doesn't try to download an x86 build.
+        # undetected-chromedriver patches the chromedriver binary IN PLACE. On a
+        # Pi we point it at the system driver (so it doesn't download an x86
+        # build), but /usr/bin/chromedriver is root-owned, so patch a private copy.
         if self.cfg.driver_path:
-            kwargs["driver_executable_path"] = self.cfg.driver_path
+            kwargs["driver_executable_path"] = _writable_driver_copy(self.cfg.driver_path)
         if self.cfg.browser_binary:
             kwargs["browser_executable_path"] = self.cfg.browser_binary
         self.driver = uc.Chrome(**kwargs)
@@ -378,6 +380,27 @@ class SeleniumFetcher:
             except Exception:  # pragma: no cover
                 pass
             self.driver = None
+
+
+def _writable_driver_copy(driver_path: str) -> str:
+    """Return a user-writable copy of `driver_path` for undetected-chromedriver
+    to patch. Re-copies when the source changes (e.g. after `apt upgrade`)."""
+    src = Path(driver_path)
+    if os.access(src, os.W_OK):
+        return str(src)
+    dest_dir = Path(__file__).resolve().parent / ".uc-driver"
+    dest = dest_dir / src.name
+    try:
+        if not dest.exists() or src.stat().st_mtime > dest.stat().st_mtime:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+            dest.chmod(0o755)
+            LOG.info("Copied %s to %s for patching.", src, dest)
+    except OSError as exc:
+        raise SystemExit(
+            f"ERROR: could not copy {src} to a writable location ({exc})."
+        ) from exc
+    return str(dest)
 
 
 def make_fetcher(cfg: Config):

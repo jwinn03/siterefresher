@@ -9,3 +9,7 @@ __pycache__/
 .venv/
 venv/
 env/
+
+# Private chromedriver copy patched by undetected-chromedriver
+.uc-driver/
+chrome-profile/
