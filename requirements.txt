@@ -3,3 +3,6 @@ requests>=2.31.0
 # protected sites such as etix.com). On Raspberry Pi also install Chromium:
 #   sudo apt install chromium chromium-driver
 selenium>=4.15.0
+# Required only when [selenium] use_undetected = true. Hides the automation
+# fingerprint to get past aggressive anti-bot systems like DataDome (etix.com).
+undetected-chromedriver>=3.5.5

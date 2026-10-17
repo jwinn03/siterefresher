@@ -42,7 +42,34 @@ Some ticketing sites layer bot protection in front of the page:
   you supply a virtual display with `xvfb` (see below).
 
 `etix.com` uses *both*. The working configuration is `fetch_backend = selenium`
-with `headless = false`.
+with `headless = false`, plus the anti-detection measures below.
+
+### Getting past DataDome (the "Access Temporarily Blocked" page)
+
+DataDome fingerprints the browser and blocks anything that looks automated. If
+you see **"Access Temporarily Blocked" / "temporarily restricted access"**, the
+client was flagged. To avoid it:
+
+1. **Leave `user_agent` blank.** A spoofed UA that disagrees with the real
+   platform (e.g. a *Windows* UA sent from a *Linux ARM* Pi) is an instant
+   giveaway. Blank = the browser's own, consistent UA.
+2. **Set `use_undetected = true`** (`pip install undetected-chromedriver`). This
+   drives a patched Chromedriver that strips the Selenium automation markers.
+3. **Set `headless = false`** (with `xvfb` on a headless Pi — see below).
+4. **Warm a persistent profile.** Point `user_data_dir` at a folder, open
+   Chromium with that profile once, pass the page manually, and the `datadome`
+   cookie persists so automated runs stay unblocked:
+   ```bash
+   chromium --user-data-dir=/home/pi/siterefresher/chrome-profile \
+            https://www.etix.com/ticket/p/70542252
+   # solve/verify, then close. The watcher reuses this profile.
+   ```
+5. **A flagged block is temporary** — wait a while (minutes–hours) for it to lift
+   before retrying, and keep the 70–90 s interval (don't hammer it).
+
+> Note: DataDome is an active arms race. The steps above work in practice but can
+> need revisiting if the site tightens its protection. A datacenter/VPN IP is far
+> more likely to be blocked than a residential one (like your Pi at home).
 
 ## Setup
 
@@ -156,6 +183,8 @@ export SR_TELEGRAM_CHAT_ID="987654321"
 | `watch`    | `state_file`     | `state.json`                     | Where last-seen state is stored           |
 | `watch`    | `user_agent`     | *(Chrome-like)*                  | HTTP User-Agent header                     |
 | `selenium` | `headless`       | `true`                           | Run browser headless (set `false` for DataDome) |
+| `selenium` | `use_undetected` | `false`                          | Use undetected-chromedriver (set `true` for DataDome) |
+| `selenium` | `user_data_dir`  | *(none)*                         | Persistent profile dir (warm the DataDome cookie) |
 | `selenium` | `browser_binary` | *(auto)*                         | Path to Chrome/Chromium (Pi: `/usr/bin/chromium`) |
 | `selenium` | `driver_path`    | *(auto)*                         | Path to chromedriver (Pi: `/usr/bin/chromedriver`) |
 | `telegram` | `token`          | *(empty)*                        | Bot token from @BotFather                 |

@@ -56,6 +56,8 @@ class Config:
     browser_binary: str
     driver_path: str
     headless: bool
+    use_undetected: bool
+    user_data_dir: str
 
     @staticmethod
     def load(path: Path) -> "Config":
@@ -113,11 +115,9 @@ class Config:
             min_interval=get_float("watch", "min_interval", 70.0),
             max_interval=get_float("watch", "max_interval", 90.0),
             request_timeout=get_float("watch", "request_timeout", 30.0),
-            user_agent=get(
-                "watch",
-                "user_agent",
-                "Mozilla/5.0 (compatible; SiteRefresher/1.0; +https://github.com/)",
-            ),
+            # Empty = let the browser use its native UA (important: a spoofed UA
+            # that disagrees with the real platform is a strong bot signal).
+            user_agent=get("watch", "user_agent", "") or "",
             state_file=Path(state_file),
             notify_on_start=get_bool("telegram", "notify_on_start", True),
             notify_on_errors=get_bool("telegram", "notify_on_errors", True),
@@ -129,6 +129,8 @@ class Config:
             browser_binary=get("selenium", "browser_binary", "") or "",
             driver_path=get("selenium", "driver_path", "") or "",
             headless=get_bool("selenium", "headless", True),
+            use_undetected=get_bool("selenium", "use_undetected", False),
+            user_data_dir=get("selenium", "user_data_dir", "") or "",
         )
 
         if cfg.min_interval > cfg.max_interval:
@@ -166,11 +168,25 @@ _WAF_CHALLENGE_MARKER = "challenge-container"
 # Below this many bytes, a document is almost certainly an interstitial/shell
 # rather than a rendered page.
 _MIN_CONTENT_LENGTH = 3000
+# Fallback UA for the requests backend only (requests has no JS for a site to
+# cross-check against, so a browser-like UA here is safe).
+_DEFAULT_REQUESTS_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+)
+# Hard block served after DataDome flags a client ("Access Temporarily Blocked").
+_HARD_BLOCK_MARKERS = ("access temporarily blocked", "temporarily restricted access")
 
 
 def _classify(html: str):
     """Return (is_interstitial, reason) for a rendered document."""
     low = html.lower()
+    if any(m in low for m in _HARD_BLOCK_MARKERS):
+        return True, (
+            "DataDome hard block ('Access Temporarily Blocked') — the client was "
+            "flagged as a bot. Use use_undetected=true, a native User-Agent, and a "
+            "warmed user_data_dir; wait for the temporary block to lift"
+        )
     if any(m in low for m in _DATADOME_MARKERS):
         return True, "DataDome device check (run with headless = false)"
     if _WAF_CHALLENGE_MARKER in low and len(html) < _MIN_CONTENT_LENGTH:
@@ -187,7 +203,7 @@ class RequestsFetcher:
         self.session = requests.Session()
         self.session.headers.update(
             {
-                "User-Agent": cfg.user_agent,
+                "User-Agent": cfg.user_agent or _DEFAULT_REQUESTS_UA,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
             }
@@ -217,16 +233,48 @@ class RequestsFetcher:
 
 
 class SeleniumFetcher:
-    """Headless-Chromium fetcher. Executes JavaScript and automatically solves
+    """Chromium fetcher. Executes JavaScript and automatically solves
     non-interactive challenges (e.g. AWS WAF 'challenge'), then returns the
-    fully rendered page HTML. Keeps one browser instance alive across checks."""
+    fully rendered page HTML. Keeps one browser instance alive across checks.
+
+    For sites behind aggressive anti-bot systems (e.g. DataDome), set
+    use_undetected = true to drive a patched Chromedriver that hides the
+    automation fingerprint, run with headless = false, leave user_agent blank
+    (so the UA matches the real platform), and point user_data_dir at a profile
+    you have warmed by passing the challenge once manually."""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.driver = None
         self._build_driver()
 
+    def _common_args(self, opts) -> None:
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--window-size=1280,1696")
+        # Only override the UA when explicitly configured; a spoofed UA that
+        # disagrees with the real platform is a strong bot signal.
+        if self.cfg.user_agent:
+            opts.add_argument(f"--user-agent={self.cfg.user_agent}")
+        if self.cfg.browser_binary:
+            opts.binary_location = self.cfg.browser_binary
+        if self.cfg.user_data_dir:
+            opts.add_argument(f"--user-data-dir={self.cfg.user_data_dir}")
+
     def _build_driver(self) -> None:
+        LOG.info(
+            "Launching Chromium (selenium backend, undetected=%s, headless=%s)...",
+            self.cfg.use_undetected,
+            self.cfg.headless,
+        )
+        if self.cfg.use_undetected:
+            self._build_undetected_driver()
+        else:
+            self._build_standard_driver()
+        self.driver.set_page_load_timeout(self.cfg.page_load_timeout + 15)
+
+    def _build_standard_driver(self) -> None:
         try:
             from selenium import webdriver
             from selenium.webdriver.chrome.options import Options
@@ -241,24 +289,13 @@ class SeleniumFetcher:
         opts = Options()
         if self.cfg.headless:
             opts.add_argument("--headless=new")
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--disable-gpu")
-        opts.add_argument("--window-size=1280,1696")
-        opts.add_argument(f"--user-agent={self.cfg.user_agent}")
+        self._common_args(opts)
         opts.add_argument("--disable-blink-features=AutomationControlled")
         opts.add_experimental_option("excludeSwitches", ["enable-automation"])
         opts.add_experimental_option("useAutomationExtension", False)
-        if self.cfg.browser_binary:
-            opts.binary_location = self.cfg.browser_binary
 
         service = Service(executable_path=self.cfg.driver_path) if self.cfg.driver_path else Service()
-
-        LOG.info(
-            "Launching Chromium (selenium backend, headless=%s)...", self.cfg.headless
-        )
         self.driver = webdriver.Chrome(options=opts, service=service)
-        self.driver.set_page_load_timeout(self.cfg.page_load_timeout + 15)
         # Hide the webdriver flag from page JS.
         try:
             self.driver.execute_cdp_cmd(
@@ -267,6 +304,34 @@ class SeleniumFetcher:
             )
         except Exception:  # pragma: no cover - not all drivers support CDP
             pass
+
+    def _build_undetected_driver(self) -> None:
+        try:
+            import undetected_chromedriver as uc
+        except ModuleNotFoundError as exc:  # pragma: no cover
+            if exc.name == "distutils":
+                raise SystemExit(
+                    "ERROR: undetected-chromedriver needs 'distutils', which was "
+                    "removed in Python 3.12+.\n"
+                    "Fix with:  pip install 'setuptools<81'\n"
+                    "(or run under Python 3.11, e.g. Raspberry Pi OS Bookworm's default)."
+                ) from exc
+            raise SystemExit(
+                "ERROR: use_undetected = true requires undetected-chromedriver.\n"
+                "Install it with:  pip install undetected-chromedriver\n"
+                f"(import failed: {exc})"
+            ) from exc
+
+        opts = uc.ChromeOptions()
+        self._common_args(opts)
+        kwargs = {"options": opts, "headless": self.cfg.headless}
+        # undetected-chromedriver patches a copy of the given chromedriver; on a
+        # Pi point it at the system one so it doesn't try to download an x86 build.
+        if self.cfg.driver_path:
+            kwargs["driver_executable_path"] = self.cfg.driver_path
+        if self.cfg.browser_binary:
+            kwargs["browser_executable_path"] = self.cfg.browser_binary
+        self.driver = uc.Chrome(**kwargs)
 
     def fetch(self, url: str) -> str:
         from selenium.common.exceptions import TimeoutException, WebDriverException
